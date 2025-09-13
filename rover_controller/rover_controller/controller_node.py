@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist, Vector3
+from geometry_msgs.msg import Twist
+from std_msgs.msg import Int16MultiArray
 import math
 
 class KinematicPUB(Node):
@@ -10,11 +11,11 @@ class KinematicPUB(Node):
 
         self.declare_parameter('wheel_radius', 0.08)  # meters
         self.declare_parameter('wheel_base', 0.358)     # meters
+        self.declare_parameter('count_rotation', 2096)
 
         self.declare_parameter('min_speed', -8.7)
         self.declare_parameter('max_speed', 8.7)
 
-        
         # Get the parameter values
         self.wheel_radius = self.get_parameter('wheel_radius').get_parameter_value().double_value
         self.wheel_base = self.get_parameter('wheel_base').get_parameter_value().double_value
@@ -22,35 +23,25 @@ class KinematicPUB(Node):
         self.min_speed = self.get_parameter('min_speed').get_parameter_value().double_value
         self.max_speed = self.get_parameter('max_speed').get_parameter_value().double_value
 
+        self.count_rotation = self.get_parameter('count_rotation').get_parameter_value().integer_value
+
+
         self.twist_subscriber = self.create_subscription(
             Twist,
-            '/diff_cont/cmd_vel_unstamped',
+            #'/diff_cont/cmd_vel_unstamped',
+            '/cmd_vel_joy',
             self.cmd_vel_callback,
             10
         )
 
         self.publisher = self.create_publisher(
-            Vector3,
+            Int16MultiArray,
             '/wheel_velocities',
             10
         )
 
-        # Safety timeout - stop if no commands received
-        #self.declare_parameter('cmd_timeout', 0.5)  # seconds
-        #self.cmd_timeout = self.get_parameter('cmd_timeout').get_parameter_value().double_value
-        
-        #self.last_cmd_time = self.get_clock().now()
-        #self.safety_timer = self.create_timer(0.1, self._safety_check)
-        
-        # Emergency stop flag
-        #self.emergency_stop = False
 
-
-
-    
     def cmd_vel_callback(self, msg: Twist):
-        self.last_cmd_time = self.get_clock().now()
-        self.emergency_stop = False
 
         try:
             # Validate input
@@ -70,19 +61,36 @@ class KinematicPUB(Node):
             v_r = (v + (omega * L / 2)) / R
 
 
-            # Limit wheel speeds to min/max range
-            #v_l, v_r = self._limit_wheel_speeds(v_l, v_r)
-            v_l_remapped = (v_l / 8.0) * 255.0
-            v_r_remapped = (v_r / 8.0) * 255.0
-            
+            v_l = max(self.min_speed, min(self.max_speed, v_l))
+            v_r = max(self.min_speed, min(self.max_speed, v_r))
 
-            wheel_vel_msg = Vector3()
-            wheel_vel_msg.x = v_l_remapped  # left wheel velocity in rad/s
-            wheel_vel_msg.y = v_r_remapped  # right wheel velocity in rad/s
-            wheel_vel_msg.z = 0.0  # unused
+
+            L_motor_counts_per_second = (v_l*self.count_rotation) / (2 * math.pi)
+            R_motor_counts_per_second = (v_r*self.count_rotation) / (2 * math.pi)
+
+            L_motor = int(L_motor_counts_per_second)
+            R_motor = int(R_motor_counts_per_second)
+
+            # Round and clamp to int16 range expected by struct.pack('<hhhh', ...)
+            def to_int16(v):
+                iv = int(round(v))
+                if iv < -32768:
+                    return -32768
+                if iv > 32767:
+                    return 32767
+                return iv
+
+            L_motor = to_int16(L_motor)
+            R_motor = to_int16(R_motor)
+
+            wheel_vel_msg = Int16MultiArray()
+            wheel_vel_msg.data = [L_motor, R_motor, L_motor, R_motor]
 
             self.publisher.publish(wheel_vel_msg)
-            self.get_logger().debug(f"Published wheel velocities: L={v_l:.2f}, R={v_r:.2f}")
+            self.get_logger().debug(
+                f"Published wheel velocities (remapped): FL={L_motor:.3f}, "
+                f"FR={R_motor:.3f}, RL={L_motor:.3f}, RR={R_motor:.3f}"
+            )
             
         except Exception as e:
             self.get_logger().error(f"Error in cmd_vel_callback: {e}")
@@ -95,38 +103,11 @@ class KinematicPUB(Node):
                 not math.isnan(msg.angular.z) and not math.isinf(msg.angular.z))   
     
 
-    def _limit_wheel_speeds(self, v_l: float, v_r: float) -> tuple:
-        """Limit wheel speeds while maintaining differential ratio"""
-        max_wheel_speed = max(abs(v_l), abs(v_r))
-        
-        if max_wheel_speed > self.max_speed:
-            # Scale both wheels proportionally
-            scale_factor = self.max_speed / max_wheel_speed
-            v_l *= scale_factor
-            v_r *= scale_factor
-        
-        # Apply individual limits
-        v_l = max(self.min_speed, min(self.max_speed, v_l))
-        v_r = max(self.min_speed, min(self.max_speed, v_r))
-        
-        return v_l, v_r
-
-    def _safety_check(self):
-        """Check for command timeout and apply emergency stop if needed"""
-        current_time = self.get_clock().now()
-        time_since_last_cmd = (current_time - self.last_cmd_time).nanoseconds / 1e9
-        
-        if time_since_last_cmd > self.cmd_timeout and not self.emergency_stop:
-            self.get_logger().warn("Command timeout - stopping rover")
-            self._publish_stop_command()
-            self.emergency_stop = True
 
     def _publish_stop_command(self):
         """Publish zero velocities to stop the rover"""
-        wheel_vel_msg = Vector3()
-        wheel_vel_msg.x = 0.0
-        wheel_vel_msg.y = 0.0
-        wheel_vel_msg.z = 0.0
+        wheel_vel_msg = Int16MultiArray()
+        wheel_vel_msg.data = [0, 0, 0, 0]
         self.publisher.publish(wheel_vel_msg)
 
 def main(args=None):
